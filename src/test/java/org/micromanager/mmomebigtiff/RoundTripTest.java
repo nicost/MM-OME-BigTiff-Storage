@@ -201,6 +201,65 @@ public class RoundTripTest {
    }
 
    @Test
+   void stringChannelValuesRoundTrip(@TempDir Path dir) {
+      OMEBigTiffStorageConfig cfg = new OMEBigTiffStorageConfig()
+            .addAxis(AxisInfo.builder("channel").type(DimensionType.CHANNEL).build())
+            .addAxis(AxisInfo.builder("z").type(DimensionType.SPACE).build());
+      OMEBigTiffStorage store = new OMEBigTiffStorage(dir.toString(), "strchan", null, cfg);
+      int w = 32;
+      int h = 24;
+      String[] channels = {"DAPI", "FITC"};
+      Map<String, short[]> written = new HashMap<>();
+      for (int c = 0; c < channels.length; c++) {
+         for (int z = 0; z < 2; z++) {
+            short[] pix = ramp16(w, h, c * 10 + z);
+            written.put(channels[c] + "/" + z, pix);
+            Map<String, Object> a = new HashMap<>();
+            a.put("channel", channels[c]);
+            a.put("z", z);
+            store.putImage(pix, null, a, false, 16, h, w);
+         }
+      }
+      store.finishedWriting();
+      store.close();
+
+      // Every (string channel, z) must come back as its own distinct plane after reopening —
+      // string axis positions map to stable integer C indices in the OME-XML TiffData records.
+      OMEBigTiffStorage re = OMEBigTiffStorage.load(store.getDiskLocation());
+      for (String ch : channels) {
+         for (int z = 0; z < 2; z++) {
+            Map<String, Object> a = new HashMap<>();
+            a.put("channel", ch);
+            a.put("z", z);
+            OMEBigTiffImage img = re.getImage(a);
+            assertNotNull(img, "missing " + ch + "/z" + z);
+            assertArrayEquals(written.get(ch + "/" + z), (short[]) img.pix, ch + "/z" + z);
+         }
+      }
+      re.close();
+   }
+
+   @Test
+   void nominalBitDepthPreserved(@TempDir Path dir) {
+      OMEBigTiffStorageConfig cfg = new OMEBigTiffStorageConfig()
+            .addAxis(AxisInfo.builder("time").type(DimensionType.TIME).build());
+      OMEBigTiffStorage store = new OMEBigTiffStorage(dir.toString(), "bits12", null, cfg);
+      int w = 16;
+      int h = 16;
+      Map<String, Object> a = new HashMap<>();
+      a.put("time", 0);
+      // A 12-bit camera image: stored as GRAY16 but the nominal bit depth must survive.
+      store.putImage(ramp16(w, h, 0), null, a, false, 12, h, w);
+      assertEquals(12, store.getEssentialImageMetadata(a).getBitDepth());
+      store.finishedWriting();
+      store.close();
+
+      OMEBigTiffStorage re = OMEBigTiffStorage.load(store.getDiskLocation());
+      assertEquals(12, re.getEssentialImageMetadata(a).getBitDepth());
+      re.close();
+   }
+
+   @Test
    void missingImageReturnsNull(@TempDir Path dir) {
       OMEBigTiffStorage store = new OMEBigTiffStorage(dir.toString(), "empty", null,
             new OMEBigTiffStorageConfig().addAxis(
