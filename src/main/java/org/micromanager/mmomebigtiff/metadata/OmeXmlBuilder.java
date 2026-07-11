@@ -36,6 +36,8 @@ public final class OmeXmlBuilder {
    /**
     * @param imageName    Image name (e.g. the dataset/position name)
     * @param type         pixel type
+    * @param significantBits nominal significant bits per sample (e.g. 12 for a 12-bit camera);
+    *                     values &lt;= 0 fall back to the storage bit width
     * @param sizeX/Y      full-resolution width/height
     * @param sizeZ/C/T    dimension sizes (each >= 1)
     * @param physX/Y      physical pixel size along x/y
@@ -43,11 +45,12 @@ public final class OmeXmlBuilder {
     * @param channels     optional per-channel descriptions (may be null/short; padded generically)
     * @param planes       one entry per written full-resolution plane
     */
-   public static String build(String imageName, PixelType type,
+   public static String build(String imageName, PixelType type, int significantBits,
                               int sizeX, int sizeY, int sizeZ, int sizeC, int sizeT,
                               double physX, double physY, String unit,
                               List<Channel> channels, List<PlaneEntry> planes) {
       String omeUnit = omeUnit(unit);
+      int sigBits = significantBits > 0 ? significantBits : type.bitDepth();
       StringBuilder sb = new StringBuilder(2048);
       sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
       sb.append("<OME xmlns=\"").append(Version.OME_NS).append("\" ")
@@ -57,7 +60,7 @@ public final class OmeXmlBuilder {
       sb.append("  <Image ID=\"Image:0\" Name=\"").append(esc(imageName)).append("\">\n");
       sb.append("    <Pixels ID=\"Pixels:0\" DimensionOrder=\"XYZCT\" Type=\"")
             .append(type.omeType()).append("\" Interleaved=\"false\" SignificantBits=\"")
-            .append(type.bitDepth()).append("\" ")
+            .append(sigBits).append("\" ")
             .append("SizeX=\"").append(sizeX).append("\" SizeY=\"").append(sizeY).append("\" ")
             .append("SizeZ=\"").append(sizeZ).append("\" SizeC=\"").append(sizeC).append("\" ")
             .append("SizeT=\"").append(sizeT).append("\"");

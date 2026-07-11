@@ -74,9 +74,15 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
    private final Map<String, Pending> pending = new ConcurrentHashMap<>();
    private final Map<String, String> customMetadata = new ConcurrentHashMap<>();
 
+   // Dense index for string-valued axis positions (e.g. channel "DAPI"), per axis, in order of
+   // first appearance. Needed because OME-TIFF addresses planes by integer Z/C/T coordinates.
+   // Persisted in the descriptor so a reload reproduces the same mapping.
+   private final Map<String, Map<String, Integer>> axisValueIndex = new ConcurrentHashMap<>();
+
    // Lazily resolved layout (set on first image / on load).
    private volatile boolean layoutResolved;
    private volatile PixelType pixelType;
+   private volatile int bitDepth; // nominal significant bits (e.g. 12 for a 12-bit camera)
    private volatile int fullWidth;
    private volatile int fullHeight;
    private volatile List<AxisInfo> nonSpatialAxes; // ordered array axes (excl. y/x, position)
@@ -90,13 +96,11 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       final Object pix;
       final int width;
       final int height;
-      final int posIndex;
 
-      Pending(Object pix, int width, int height, int posIndex) {
+      Pending(Object pix, int width, int height) {
          this.pix = pix;
          this.width = width;
          this.height = height;
-         this.posIndex = posIndex;
       }
    }
 
@@ -196,13 +200,12 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       }
       final Map<String, Object> axesCopy = new LinkedHashMap<>(axes);
       final String axesKey = AxesKey.serialize(axesCopy);
-      final int posIndex = multiPosition
-            ? AxesKey.intValue(axesCopy, config.getPositionAxis(), 0) : 0;
+      final int posIndex = posIndexOf(axesCopy);
 
       // Record per-image metadata in memory synchronously (readable immediately); the flushed
       // sidecar append happens on the writer thread.
       perImageMeta.put(axesKey, metadataJson);
-      pending.put(axesKey, new Pending(pixels, imageWidth, imageHeight, posIndex));
+      pending.put(axesKey, new Pending(pixels, imageWidth, imageHeight));
 
       return submitWrite(() -> {
          TiffPyramidWriter writer = writerFor(posIndex);
@@ -355,7 +358,7 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
          w = loc.width[level];
          h = loc.height[level];
       }
-      return new EssentialImageMetadata(w, h, pixelType.bitDepth(), false);
+      return new EssentialImageMetadata(w, h, bitDepth, false);
    }
 
    @Override
@@ -529,7 +532,10 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       try {
          f.get();
       } catch (InterruptedException e) {
+         // Must not return normally: the caller would mark the dataset finished and close the
+         // file channels while the writer thread may still be finalizing them.
          Thread.currentThread().interrupt();
+         throw new RuntimeException("Interrupted while waiting for pending writes", e);
       } catch (ExecutionException e) {
          throw new RuntimeException(e.getCause());
       }
@@ -548,6 +554,7 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
    private void resolveLayout(Map<String, Object> axes, boolean rgb, int bitDepth,
                               int width, int height) {
       this.pixelType = PixelType.of(rgb, bitDepth);
+      this.bitDepth = bitDepth > 0 ? bitDepth : this.pixelType.bitDepth();
       this.fullWidth = width;
       this.fullHeight = height;
       this.multiPosition = axes.containsKey(config.getPositionAxis());
@@ -628,13 +635,42 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       }
    }
 
+   /**
+    * Integer position of an axis value: numbers directly, strings via the per-axis
+    * first-appearance index (OME-TIFF addresses planes by integer coordinates).
+    */
+   private int axisIndexOf(Map<String, Object> axes, String axis, int dflt) {
+      Object v = axes.get(axis);
+      if (v instanceof Number) {
+         return ((Number) v).intValue();
+      }
+      if (v instanceof String) {
+         return valueIndex(axis, (String) v);
+      }
+      return dflt;
+   }
+
+   /** Dense index of a string axis value, assigned in order of first appearance. */
+   private int valueIndex(String axis, String value) {
+      Map<String, Integer> byValue =
+            axisValueIndex.computeIfAbsent(axis, k -> new LinkedHashMap<>());
+      synchronized (byValue) {
+         Integer i = byValue.get(value);
+         if (i == null) {
+            i = byValue.size();
+            byValue.put(value, i);
+         }
+         return i;
+      }
+   }
+
    /** Map an axes map to its (z,c,t) coordinate using the resolved axis types. */
    private int[] zctOf(Map<String, Object> axes) {
       int z = 0;
       int c = 0;
       int t = 0;
       for (AxisInfo a : nonSpatialAxes) {
-         int v = AxesKey.intValue(axes, a.getName(), 0);
+         int v = axisIndexOf(axes, a.getName(), 0);
          String dim = a.getType().omeDimension();
          if ("Z".equals(dim)) {
             z = v;
@@ -667,15 +703,33 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       int sizeT = dimCount(DimensionType.TIME, sizes[2]);
       AxisInfo ch = channelAxis();
       List<Channel> channels = ch == null ? null : ch.getChannels();
+      if (channels == null && ch != null) {
+         channels = channelsFromStringValues(ch.getName());
+      }
       if (channels != null) {
          sizeC = Math.max(sizeC, channels.size());
       }
       String imageName = multiPosition ? baseName + "_p" + posIndex : baseName;
       List<OmeXmlBuilder.PlaneEntry> entries =
             planeEntries.getOrDefault(posIndex, new ArrayList<>());
-      return OmeXmlBuilder.build(imageName, pixelType, fullWidth, fullHeight,
+      return OmeXmlBuilder.build(imageName, pixelType, bitDepth, fullWidth, fullHeight,
             sizeZ, sizeC, sizeT, config.getPixelSizeX(), config.getPixelSizeY(),
             config.getSpatialUnit(), channels, entries);
+   }
+
+   /** Synthesize Channel names from string-valued channel positions, if any were used. */
+   private List<Channel> channelsFromStringValues(String axisName) {
+      Map<String, Integer> byValue = axisValueIndex.get(axisName);
+      if (byValue == null) {
+         return null;
+      }
+      synchronized (byValue) {
+         List<Channel> out = new ArrayList<>(byValue.size());
+         for (String name : byValue.keySet()) { // LinkedHashMap: iteration order == index order
+            out.add(new Channel(name));
+         }
+         return out;
+      }
    }
 
    /** Declared fixed count for a dimension if any axis of that type declares one, else observed. */
@@ -698,6 +752,7 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       d.put("compression", config.getCompression().getId());
       d.put("numResolutionLevels", numResLevels);
       d.put("pixelType", pixelType == null ? null : pixelType.omeType());
+      d.put("bitDepth", pixelType == null ? null : bitDepth);
       d.put("fullWidth", fullWidth);
       d.put("fullHeight", fullHeight);
       d.put("pixelSizeY", config.getPixelSizeY());
@@ -719,6 +774,15 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
          }
       }
       d.put("axes", axesList);
+      if (!axisValueIndex.isEmpty()) {
+         Map<String, Object> values = new LinkedHashMap<>();
+         for (Map.Entry<String, Map<String, Integer>> e : axisValueIndex.entrySet()) {
+            synchronized (e.getValue()) {
+               values.put(e.getKey(), new ArrayList<>(e.getValue().keySet()));
+            }
+         }
+         d.put("axisValues", values);
+      }
       if (summaryMetadataJson != null) {
          d.put("summary", JsonUtil.parseObject(summaryMetadataJson));
       }
@@ -759,6 +823,9 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       this.fullHeight = ((Number) d.getOrDefault("fullHeight", 0)).intValue();
       Object pt = d.get("pixelType");
       this.pixelType = pt == null ? PixelType.GRAY16 : PixelType.fromOmeType(String.valueOf(pt));
+      Object bd = d.get("bitDepth");
+      this.bitDepth = bd instanceof Number && ((Number) bd).intValue() > 0
+            ? ((Number) bd).intValue() : pixelType.bitDepth();
       if (d.get("positionAxis") != null) {
          config.positionAxis(String.valueOf(d.get("positionAxis")));
       }
@@ -791,6 +858,18 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       }
       this.nonSpatialAxes = axes;
 
+      // Restore string-value -> index mappings so zctOf/posIndexOf resolve as when written.
+      if (d.get("axisValues") instanceof Map) {
+         for (Map.Entry<String, Object> e : ((Map<String, Object>) d.get("axisValues")).entrySet()) {
+            Map<String, Integer> byValue = new LinkedHashMap<>();
+            int i = 0;
+            for (Object v : (List<Object>) e.getValue()) {
+               byValue.put(String.valueOf(v), i++);
+            }
+            axisValueIndex.put(e.getKey(), byValue);
+         }
+      }
+
       String summary = null;
       if (d.get("summary") != null) {
          summary = JsonUtil.toJson(d.get("summary"));
@@ -803,8 +882,7 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
 
       // Open each position file and build the plane index from the sidecar's axes maps.
       for (Map<String, Object> axesMap : getAxesSetInternal()) {
-         int posIndex = multiPosition
-               ? AxesKey.intValue(axesMap, config.getPositionAxis(), 0) : 0;
+         int posIndex = posIndexOf(axesMap);
          TiffPyramidReader r = readerFor(posIndex);
          if (r == null) {
             continue;
@@ -852,7 +930,7 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
    // -------------------------------------------------------------------------
 
    private int posIndexOf(Map<String, Object> axes) {
-      return multiPosition ? AxesKey.intValue(axes, config.getPositionAxis(), 0) : 0;
+      return multiPosition ? axisIndexOf(axes, config.getPositionAxis(), 0) : 0;
    }
 
    private String fileNameForPosition(int posIndex) {
