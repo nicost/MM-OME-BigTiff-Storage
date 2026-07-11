@@ -5,6 +5,7 @@ import org.micromanager.mmomebigtiff.metadata.PerImageMetadataStore;
 import org.micromanager.mmomebigtiff.tiff.PlaneLocation;
 import org.micromanager.mmomebigtiff.tiff.TiffPyramidReader;
 import org.micromanager.mmomebigtiff.tiff.TiffPyramidWriter;
+import org.micromanager.mmomebigtiff.tiff.TiledTiffWriter;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -65,7 +66,11 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
 
    // Per-position TIFF writers/readers and plane index.
    private final Map<Integer, TiffPyramidWriter> writers = new ConcurrentHashMap<>();
+   private final Map<Integer, TiledTiffWriter> tiledWriters = new ConcurrentHashMap<>();
    private final Map<Integer, TiffPyramidReader> readers = new ConcurrentHashMap<>();
+   // Axes keys whose per-image metadata has already been appended to the sidecar (a tiled plane
+   // is written as many putTile calls but must appear once in the sidecar / axes set).
+   private final Set<String> appendedMeta = ConcurrentHashMap.newKeySet();
    private final Map<Integer, Map<String, PlaneLocation>> planeIndex = new ConcurrentHashMap<>();
    private final Map<Integer, List<OmeXmlBuilder.PlaneEntry>> planeEntries = new ConcurrentHashMap<>();
    private final Map<Integer, int[]> zctSizeByPos = new ConcurrentHashMap<>(); // {sizeZ,sizeC,sizeT}
@@ -88,6 +93,16 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
    private volatile List<AxisInfo> nonSpatialAxes; // ordered array axes (excl. y/x, position)
    private volatile boolean multiPosition;
    private volatile int numResLevels;
+
+   // Tiled-mode layout (config.isTiled()); zero/false when writing single-strip planes.
+   private volatile boolean tiled;
+   private volatile long canvasWidth;
+   private volatile long canvasHeight;
+   private volatile int tileWidth;
+   private volatile int tileHeight;
+   private volatile int declZ = 1; // declared Z/C/T sizes: fixed plane grid for IFD indexing
+   private volatile int declC = 1;
+   private volatile int declT = 1;
 
    private volatile boolean finished;
    private final boolean readOnly;
@@ -213,9 +228,66 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
          planeIndex.computeIfAbsent(posIndex, k -> new ConcurrentHashMap<>()).put(axesKey, loc);
          recordPlaneMapping(posIndex, axesCopy);
          perImageMeta.append(axesCopy, metadataJson);
+         appendedMeta.add(axesKey);
          pending.remove(axesKey);
          return null;
       });
+   }
+
+   /**
+    * Write one tile of a plane (tiled mode only; requires a full plane size declared via
+    * {@link OMEBigTiffStorageConfig#fullPlaneSize}). The tile pixel array must hold exactly
+    * {@code tileWidth*tileHeight} samples; edge tiles are zero-padded by the caller.
+    *
+    * @param tilePixels   primitive pixel array of length {@code tileWidth*tileHeight}
+    * @param metadataJson per-plane metadata JSON (recorded once per plane; may be null)
+    * @param axes         axes identifying the plane this tile belongs to
+    * @param tileCol      tile column (0-based) within the plane
+    * @param tileRow      tile row (0-based) within the plane
+    * @param rgb          whether the image is RGB (unsupported)
+    * @param bitDepth     bits per sample (8/12/16/32)
+    * @return a future completing when the tile is durably written
+    */
+   public Future<Void> putTile(Object tilePixels, String metadataJson, Map<String, Object> axes,
+                               int tileCol, int tileRow, boolean rgb, int bitDepth) {
+      if (readOnly || finished) {
+         throw new IllegalStateException("Dataset is not writable.");
+      }
+      if (!config.isTiled()) {
+         throw new IllegalStateException("putTile requires tiled mode; declare fullPlaneSize in "
+               + "the config. Use putImage for single-strip planes.");
+      }
+      rethrowIfWriteFailed();
+      if (!layoutResolved) {
+         synchronized (this) {
+            if (!layoutResolved) {
+               resolveLayout(axes, rgb, bitDepth, tileWidthOrDefault(), tileHeightOrDefault());
+            }
+         }
+      }
+      final Map<String, Object> axesCopy = new LinkedHashMap<>(axes);
+      final String axesKey = AxesKey.serialize(axesCopy);
+      final int posIndex = posIndexOf(axesCopy);
+      final int plane = planeIndexOf(axesCopy);
+      perImageMeta.put(axesKey, metadataJson);
+      final boolean firstForPlane = appendedMeta.add(axesKey);
+
+      return submitWrite(() -> {
+         TiledTiffWriter writer = tiledWriterFor(posIndex);
+         writer.writeTile(plane, 0, tileCol, tileRow, tilePixels);
+         if (firstForPlane) {
+            perImageMeta.append(axesCopy, metadataJson);
+         }
+         return null;
+      });
+   }
+
+   private int tileWidthOrDefault() {
+      return config.getTileWidth();
+   }
+
+   private int tileHeightOrDefault() {
+      return config.getTileHeight();
    }
 
    private TiffPyramidWriter writerFor(int posIndex) throws IOException {
@@ -230,6 +302,25 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       planeEntries.put(posIndex, new ArrayList<>());
       zctSizeByPos.put(posIndex, new int[]{1, 1, 1});
       return w;
+   }
+
+   private TiledTiffWriter tiledWriterFor(int posIndex) throws IOException {
+      TiledTiffWriter w = tiledWriters.get(posIndex);
+      if (w != null) {
+         return w;
+      }
+      Path file = root.resolve(fileNameForPosition(posIndex));
+      int numPlanes = declZ * declC * declT;
+      w = new TiledTiffWriter(file, pixelType, canvasWidth, canvasHeight, tileWidth, tileHeight,
+            numResLevels, numPlanes, config.getCompression(), BYTE_ORDER, config.getPixelSizeX());
+      tiledWriters.put(posIndex, w);
+      return w;
+   }
+
+   /** IFD/plane index of a plane within its position file (XYZCT order, Z fastest). */
+   private int planeIndexOf(Map<String, Object> axes) {
+      int[] zct = zctOf(axes);
+      return (zct[2] * declC + zct[1]) * declZ + zct[0];
    }
 
    /** Record a plane's (z,c,t) → IFD-index mapping and update the position's Z/C/T sizes. */
@@ -276,14 +367,101 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       return getImage(axes, 0);
    }
 
+   private static final int MAX_ARRAY = Integer.MAX_VALUE - 8;
+
    @Override
    public OMEBigTiffImage getImage(Map<String, Object> axes, int level) {
       String axesKey = AxesKey.serialize(axes);
+      if (tiled || isReopenedTiled(axes, axesKey)) {
+         long[] wh = levelCanvas(axes, axesKey, level);
+         if (wh == null) {
+            return null;
+         }
+         if (wh[0] * wh[1] > MAX_ARRAY) {
+            throw new IllegalStateException("Plane at level " + level + " is " + wh[0] + "x" + wh[1]
+                  + " (" + (wh[0] * wh[1]) + " px), too large to return as one array; use "
+                  + "getRegion(axes, level, x, y, w, h).");
+         }
+         return getRegion(axes, level, 0, 0, (int) wh[0], (int) wh[1]);
+      }
       Object pix = readPixels(axes, axesKey, level);
       if (pix == null) {
          return null;
       }
       return new OMEBigTiffImage(pix, perImageMeta.get(axesKey));
+   }
+
+   /**
+    * Read a rectangular region of a tiled plane at the given resolution level, touching only the
+    * covering tiles. Coordinates are in level-{@code level} pixels.
+    *
+    * @return the region pixels + plane metadata, or null if the plane/level does not exist
+    */
+   public OMEBigTiffImage getRegion(Map<String, Object> axes, int level, long x, long y,
+                                    int w, int h) {
+      String axesKey = AxesKey.serialize(axes);
+      Object pix = readRegionInternal(axes, axesKey, level, x, y, w, h);
+      if (pix == null) {
+         return null;
+      }
+      return new OMEBigTiffImage(pix, perImageMeta.get(axesKey));
+   }
+
+   private Object readRegionInternal(Map<String, Object> axes, String axesKey, int level,
+                                     long x, long y, int w, int h) {
+      if (level < 0 || level >= numResLevels) {
+         return null;
+      }
+      int posIndex = posIndexOf(axes);
+      try {
+         TiledTiffWriter tw = tiledWriters.get(posIndex);
+         if (tw != null) {
+            if (!perImageMeta.has(axesKey)) {
+               return null;
+            }
+            return tw.readRegion(planeIndexOf(axes), level, x, y, w, h);
+         }
+         TiffPyramidReader r = readers.get(posIndex);
+         if (r != null) {
+            Map<String, PlaneLocation> byKey = planeIndex.get(posIndex);
+            PlaneLocation loc = byKey == null ? null : byKey.get(axesKey);
+            if (loc == null || !loc.tiled || level >= loc.numLevels()) {
+               return null;
+            }
+            return r.readRegion(loc, level, x, y, w, h,
+                  config.getCompression() == Compression.DEFLATE);
+         }
+         return null;
+      } catch (IOException e) {
+         throw new UncheckedIOException("Failed to read region at level " + level, e);
+      }
+   }
+
+   private boolean isReopenedTiled(Map<String, Object> axes, String axesKey) {
+      Map<String, PlaneLocation> byKey = planeIndex.get(posIndexOf(axes));
+      PlaneLocation loc = byKey == null ? null : byKey.get(axesKey);
+      return loc != null && loc.tiled;
+   }
+
+   /** Level-{@code level} canvas dimensions of a tiled plane, or null if it does not exist. */
+   private long[] levelCanvas(Map<String, Object> axes, String axesKey, int level) {
+      if (level < 0 || level >= numResLevels) {
+         return null;
+      }
+      int posIndex = posIndexOf(axes);
+      TiledTiffWriter tw = tiledWriters.get(posIndex);
+      if (tw != null) {
+         if (!perImageMeta.has(axesKey)) {
+            return null;
+         }
+         return new long[]{tw.levelWidth(level), tw.levelHeight(level)};
+      }
+      Map<String, PlaneLocation> byKey = planeIndex.get(posIndex);
+      PlaneLocation loc = byKey == null ? null : byKey.get(axesKey);
+      if (loc == null || !loc.tiled || level >= loc.numLevels()) {
+         return null;
+      }
+      return new long[]{loc.width[level], loc.height[level]};
    }
 
    private Object readPixels(Map<String, Object> axes, String axesKey, int level) {
@@ -339,6 +517,15 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       if (!hasImage(axes, level)) {
          return null;
       }
+      if (tiled || isReopenedTiled(axes, axesKey)) {
+         long[] wh = levelCanvas(axes, axesKey, level);
+         if (wh == null) {
+            return null;
+         }
+         int w = (int) Math.min(wh[0], Integer.MAX_VALUE);
+         int h = (int) Math.min(wh[1], Integer.MAX_VALUE);
+         return new EssentialImageMetadata(w, h, bitDepth, false);
+      }
       Pending p = pending.get(axesKey);
       int w;
       int h;
@@ -373,6 +560,11 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       }
       String axesKey = AxesKey.serialize(axes);
       if (pending.containsKey(axesKey)) {
+         return true;
+      }
+      // Tiled planes are not recorded in planeIndex during writing; the sidecar index is the
+      // source of truth for which planes exist (both while writing and after reopen-by-writer).
+      if (tiledWriters.containsKey(posIndexOf(axes)) && perImageMeta.has(axesKey)) {
          return true;
       }
       Map<String, PlaneLocation> byKey = planeIndex.get(posIndexOf(axes));
@@ -433,8 +625,11 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       }
       Future<Void> f = submitWrite(() -> {
          for (Map.Entry<Integer, TiffPyramidWriter> e : writers.entrySet()) {
-            int pos = e.getKey();
-            byte[] omeXml = buildOmeXml(pos).getBytes(StandardCharsets.UTF_8);
+            byte[] omeXml = buildOmeXml(e.getKey()).getBytes(StandardCharsets.UTF_8);
+            e.getValue().finish(omeXml);
+         }
+         for (Map.Entry<Integer, TiledTiffWriter> e : tiledWriters.entrySet()) {
+            byte[] omeXml = buildOmeXml(e.getKey()).getBytes(StandardCharsets.UTF_8);
             e.getValue().finish(omeXml);
          }
          writeDescriptor();
@@ -483,6 +678,9 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       }
       perImageMeta.close();
       for (TiffPyramidWriter w : writers.values()) {
+         w.close();
+      }
+      for (TiledTiffWriter w : tiledWriters.values()) {
          w.close();
       }
       for (TiffPyramidReader r : readers.values()) {
@@ -555,13 +753,52 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
                               int width, int height) {
       this.pixelType = PixelType.of(rgb, bitDepth);
       this.bitDepth = bitDepth > 0 ? bitDepth : this.pixelType.bitDepth();
-      this.fullWidth = width;
-      this.fullHeight = height;
       this.multiPosition = axes.containsKey(config.getPositionAxis());
       this.nonSpatialAxes = resolveAxes(axes);
       validateDimensions(nonSpatialAxes);
+      this.tiled = config.isTiled();
+      if (tiled) {
+         this.canvasWidth = config.getFullPlaneWidth();
+         this.canvasHeight = config.getFullPlaneHeight();
+         this.tileWidth = config.getTileWidth();
+         this.tileHeight = config.getTileHeight();
+         this.fullWidth = (int) Math.min(canvasWidth, Integer.MAX_VALUE);
+         this.fullHeight = (int) Math.min(canvasHeight, Integer.MAX_VALUE);
+         computeDeclaredZct();
+      } else {
+         this.fullWidth = width;
+         this.fullHeight = height;
+      }
       writeDescriptor();
       this.layoutResolved = true;
+   }
+
+   /**
+    * Tiled mode preallocates one IFD per (z,c,t) plane, so the Z/C/T counts must be known up
+    * front: each declared non-position axis must have a fixed {@code count}. Missing dimensions
+    * default to size 1.
+    */
+   private void computeDeclaredZct() {
+      int z = 1;
+      int c = 1;
+      int t = 1;
+      for (AxisInfo a : nonSpatialAxes) {
+         String dim = a.getType().omeDimension();
+         if (a.getCount() == null) {
+            throw new IllegalArgumentException("Tiled mode requires a fixed count for axis '"
+                  + a.getName() + "'. Set .count(n) on the axis (the plane grid is preallocated).");
+         }
+         if ("Z".equals(dim)) {
+            z = a.getCount();
+         } else if ("C".equals(dim)) {
+            c = a.getCount();
+         } else if ("T".equals(dim)) {
+            t = a.getCount();
+         }
+      }
+      this.declZ = z;
+      this.declC = c;
+      this.declT = t;
    }
 
    private List<AxisInfo> resolveAxes(Map<String, Object> firstAxes) {
@@ -710,9 +947,30 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
          sizeC = Math.max(sizeC, channels.size());
       }
       String imageName = multiPosition ? baseName + "_p" + posIndex : baseName;
-      List<OmeXmlBuilder.PlaneEntry> entries =
-            planeEntries.getOrDefault(posIndex, new ArrayList<>());
-      return OmeXmlBuilder.build(imageName, pixelType, bitDepth, fullWidth, fullHeight,
+      int planeW = fullWidth;
+      int planeH = fullHeight;
+      List<OmeXmlBuilder.PlaneEntry> entries;
+      if (tiled) {
+         // Fixed plane grid: emit a TiffData record for every (z,c,t) plane deterministically,
+         // matching the IFD order used by planeIndexOf (XYZCT, Z fastest).
+         sizeZ = declZ;
+         sizeC = declC;
+         sizeT = declT;
+         planeW = (int) Math.min(canvasWidth, Integer.MAX_VALUE);
+         planeH = (int) Math.min(canvasHeight, Integer.MAX_VALUE);
+         entries = new ArrayList<>(declZ * declC * declT);
+         for (int t = 0; t < declT; t++) {
+            for (int c = 0; c < declC; c++) {
+               for (int z = 0; z < declZ; z++) {
+                  int ifd = (t * declC + c) * declZ + z;
+                  entries.add(new OmeXmlBuilder.PlaneEntry(ifd, z, c, t));
+               }
+            }
+         }
+      } else {
+         entries = planeEntries.getOrDefault(posIndex, new ArrayList<>());
+      }
+      return OmeXmlBuilder.build(imageName, pixelType, bitDepth, planeW, planeH,
             sizeZ, sizeC, sizeT, config.getPixelSizeX(), config.getPixelSizeY(),
             config.getSpatialUnit(), channels, entries);
    }
@@ -755,6 +1013,16 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       d.put("bitDepth", pixelType == null ? null : bitDepth);
       d.put("fullWidth", fullWidth);
       d.put("fullHeight", fullHeight);
+      d.put("tiled", tiled);
+      if (tiled) {
+         d.put("canvasWidth", canvasWidth);
+         d.put("canvasHeight", canvasHeight);
+         d.put("tileWidth", tileWidth);
+         d.put("tileHeight", tileHeight);
+         d.put("sizeZ", declZ);
+         d.put("sizeC", declC);
+         d.put("sizeT", declT);
+      }
       d.put("pixelSizeY", config.getPixelSizeY());
       d.put("pixelSizeX", config.getPixelSizeX());
       d.put("spatialUnit", config.getSpatialUnit());
@@ -821,6 +1089,16 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       this.numResLevels = ((Number) d.getOrDefault("numResolutionLevels", 1)).intValue();
       this.fullWidth = ((Number) d.getOrDefault("fullWidth", 0)).intValue();
       this.fullHeight = ((Number) d.getOrDefault("fullHeight", 0)).intValue();
+      this.tiled = Boolean.TRUE.equals(d.get("tiled"));
+      if (tiled) {
+         this.canvasWidth = ((Number) d.getOrDefault("canvasWidth", 0)).longValue();
+         this.canvasHeight = ((Number) d.getOrDefault("canvasHeight", 0)).longValue();
+         this.tileWidth = ((Number) d.getOrDefault("tileWidth", 512)).intValue();
+         this.tileHeight = ((Number) d.getOrDefault("tileHeight", 512)).intValue();
+         this.declZ = ((Number) d.getOrDefault("sizeZ", 1)).intValue();
+         this.declC = ((Number) d.getOrDefault("sizeC", 1)).intValue();
+         this.declT = ((Number) d.getOrDefault("sizeT", 1)).intValue();
+      }
       Object pt = d.get("pixelType");
       this.pixelType = pt == null ? PixelType.GRAY16 : PixelType.fromOmeType(String.valueOf(pt));
       Object bd = d.get("bitDepth");

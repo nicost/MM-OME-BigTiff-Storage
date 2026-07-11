@@ -34,6 +34,21 @@ public final class OMEBigTiffStorageConfig {
    /** Number of pyramid resolution levels (1 = no pyramid). Each level halves y and x. */
    private int numResolutionLevels = 1;
 
+   /**
+    * Full plane (canvas) width/height in pixels for tiled mode. Zero (the default) means
+    * untiled: each plane is written as one strip and its size is taken from the first image.
+    * When both are &gt; 0 the writer switches to tiled OME-BigTIFF: every plane spans a fixed
+    * canvas of this size, images are written as {@code tileWidth}×{@code tileHeight} tiles, and
+    * readers can fetch sub-regions without reading the whole plane. Required for planes larger
+    * than a Java array can hold (~2.1 gigapixels).
+    */
+   private long fullPlaneWidth = 0;
+   private long fullPlaneHeight = 0;
+
+   /** Tile dimensions for tiled mode (TIFF requires multiples of 16). */
+   private int tileWidth = 512;
+   private int tileHeight = 512;
+
    /** If true, {@code putImage} auto-computes and writes all pyramid levels by 2x2 averaging. */
    private boolean autoDownsample = true;
 
@@ -129,5 +144,51 @@ public final class OMEBigTiffStorageConfig {
    public OMEBigTiffStorageConfig savingQueueSize(int savingQueueSize) {
       this.savingQueueSize = savingQueueSize;
       return this;
+   }
+
+   public long getFullPlaneWidth() {
+      return fullPlaneWidth;
+   }
+
+   public long getFullPlaneHeight() {
+      return fullPlaneHeight;
+   }
+
+   /**
+    * Declare the full plane (canvas) size and switch to tiled OME-BigTIFF. Both dimensions must
+    * be positive.
+    */
+   public OMEBigTiffStorageConfig fullPlaneSize(long width, long height) {
+      if (width <= 0 || height <= 0) {
+         throw new IllegalArgumentException(
+               "fullPlaneSize dimensions must be positive, got " + width + "x" + height);
+      }
+      this.fullPlaneWidth = width;
+      this.fullPlaneHeight = height;
+      return this;
+   }
+
+   public int getTileWidth() {
+      return tileWidth;
+   }
+
+   public int getTileHeight() {
+      return tileHeight;
+   }
+
+   /** Set the tile dimensions for tiled mode. TIFF requires each to be a positive multiple of 16. */
+   public OMEBigTiffStorageConfig tileSize(int width, int height) {
+      if (width <= 0 || height <= 0 || (width % 16) != 0 || (height % 16) != 0) {
+         throw new IllegalArgumentException(
+               "tileSize dimensions must be positive multiples of 16, got " + width + "x" + height);
+      }
+      this.tileWidth = width;
+      this.tileHeight = height;
+      return this;
+   }
+
+   /** Whether tiled output is enabled (a full plane size has been declared). */
+   public boolean isTiled() {
+      return fullPlaneWidth > 0 && fullPlaneHeight > 0;
    }
 }

@@ -73,6 +73,30 @@ public final class TiffPixelCodec {
       }
    }
 
+   /** A zeroed primitive pixel array of {@code numPixels} elements of the given type. */
+   public static Object blankTile(PixelType type, int numPixels) {
+      switch (type) {
+         case GRAY8:  return new byte[numPixels];
+         case GRAY16: return new short[numPixels];
+         case GRAY32: return new float[numPixels];
+         default:     throw new IllegalArgumentException("Unsupported pixel type: " + type);
+      }
+   }
+
+   /**
+    * Copy a {@code w}×{@code h} rectangle between two row-major primitive pixel arrays of the same
+    * type. Rows are copied with {@link System#arraycopy}; callers ensure the rectangle lies within
+    * both arrays.
+    */
+   public static void copyRegion(Object src, int srcW, int srcX, int srcY,
+                                 Object dst, int dstW, int dstX, int dstY, int w, int h) {
+      for (int row = 0; row < h; row++) {
+         int s = (srcY + row) * srcW + srcX;
+         int d = (dstY + row) * dstW + dstX;
+         System.arraycopy(src, s, dst, d, w);
+      }
+   }
+
    /** Deflate (zlib) compression of a raw strip. */
    public static byte[] deflate(byte[] raw) {
       Deflater deflater = new Deflater(Deflater.DEFAULT_COMPRESSION);

@@ -121,6 +121,39 @@ public final class TiffPyramidReader implements AutoCloseable {
       return TiffPixelCodec.fromRawBytes(raw, type, order, numPixels);
    }
 
+   /** Read one tile (full {@code tileWidth*tileHeight}) of a tiled plane's level. */
+   public Object readTile(PlaneLocation loc, int level, int tileCol, int tileRow, boolean deflate)
+         throws IOException {
+      int numPixels = loc.tileWidth * loc.tileHeight;
+      int tileIndex = tileRow * loc.tilesAcross[level] + tileCol;
+      long off = loc.tileOffsets[level][tileIndex];
+      long count = loc.tileByteCounts[level][tileIndex];
+      if (off == 0 || count == 0) {
+         return TiffPixelCodec.fromRawBytes(new byte[TiffPixelCodec.rawByteCount(type, numPixels)],
+               type, order, numPixels);
+      }
+      ByteBuffer bb = ByteBuffer.allocate((int) count);
+      while (bb.hasRemaining()) {
+         int n = channel.read(bb, off + bb.position());
+         if (n < 0) {
+            break;
+         }
+      }
+      byte[] onDisk = bb.array();
+      byte[] raw = deflate
+            ? TiffPixelCodec.inflate(onDisk, TiffPixelCodec.rawByteCount(type, numPixels))
+            : onDisk;
+      return TiffPixelCodec.fromRawBytes(raw, type, order, numPixels);
+   }
+
+   /** Read an arbitrary region of a tiled plane's level, touching only the covering tiles. */
+   public Object readRegion(PlaneLocation loc, int level, long x, long y, int w, int h,
+                            boolean deflate) throws IOException {
+      return Tiles.readRegion((lvl, tc, tr) -> readTile(loc, lvl, tc, tr, deflate),
+            type, level, loc.tileWidth, loc.tileHeight, loc.width[level], loc.height[level],
+            x, y, w, h);
+   }
+
    @Override
    public void close() {
       try {
@@ -208,19 +241,31 @@ public final class TiffPyramidReader implements AutoCloseable {
 
    private static PlaneLocation planeFromIfd(FileChannel channel, Ifd ifd, ByteOrder order,
                                              boolean bigTiff) throws IOException {
-      List<long[]> levels = new ArrayList<>(); // {offset, byteCount, width, height}
-      levels.add(new long[]{ifd.stripOffset, ifd.stripByteCount, ifd.width, ifd.height});
+      List<Ifd> levels = new ArrayList<>();
+      levels.add(ifd);
       for (long subOff : ifd.subIfds) {
-         Ifd sub = readIfd(channel, subOff, order, bigTiff);
-         levels.add(new long[]{sub.stripOffset, sub.stripByteCount, sub.width, sub.height});
+         levels.add(readIfd(channel, subOff, order, bigTiff));
+      }
+      if (ifd.tileWidth > 0) {
+         PlaneLocation loc = PlaneLocation.tiled(levels.size(), ifd.tileWidth, ifd.tileHeight);
+         for (int l = 0; l < levels.size(); l++) {
+            Ifd li = levels.get(l);
+            loc.width[l] = (int) li.width;
+            loc.height[l] = (int) li.height;
+            loc.tilesAcross[l] = (int) ((li.width + ifd.tileWidth - 1) / ifd.tileWidth);
+            loc.tilesDown[l] = (int) ((li.height + ifd.tileHeight - 1) / ifd.tileHeight);
+            loc.tileOffsets[l] = li.tileOffsets;
+            loc.tileByteCounts[l] = li.tileByteCounts;
+         }
+         return loc;
       }
       PlaneLocation loc = new PlaneLocation(levels.size());
       for (int l = 0; l < levels.size(); l++) {
-         long[] v = levels.get(l);
-         loc.offset[l] = v[0];
-         loc.byteCount[l] = v[1];
-         loc.width[l] = (int) v[2];
-         loc.height[l] = (int) v[3];
+         Ifd li = levels.get(l);
+         loc.offset[l] = li.stripOffset;
+         loc.byteCount[l] = li.stripByteCount;
+         loc.width[l] = (int) li.width;
+         loc.height[l] = (int) li.height;
       }
       return loc;
    }
@@ -237,6 +282,11 @@ public final class TiffPyramidReader implements AutoCloseable {
       long[] subIfds = new long[0];
       long nextIfd;
       String imageDescription;
+      // Tiled planes (TIFF tags 322-325); tileWidth == 0 means untiled (single strip).
+      int tileWidth;
+      int tileHeight;
+      long[] tileOffsets = new long[0];
+      long[] tileByteCounts = new long[0];
    }
 
    private static Ifd readIfd(FileChannel channel, long off, ByteOrder order, boolean bigTiff)
@@ -281,6 +331,18 @@ public final class TiffPyramidReader implements AutoCloseable {
                break;
             case 270:
                ifd.imageDescription = readAscii(channel, entries, valuePos, count, order, bigTiff);
+               break;
+            case 322:
+               ifd.tileWidth = (int) readScalar(channel, entries, valuePos, type, order, bigTiff);
+               break;
+            case 323:
+               ifd.tileHeight = (int) readScalar(channel, entries, valuePos, type, order, bigTiff);
+               break;
+            case 324:
+               ifd.tileOffsets = readOffsets(channel, entries, valuePos, count, order, bigTiff);
+               break;
+            case 325:
+               ifd.tileByteCounts = readOffsets(channel, entries, valuePos, count, order, bigTiff);
                break;
             default:
                break;
