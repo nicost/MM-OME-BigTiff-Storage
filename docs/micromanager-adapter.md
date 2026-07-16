@@ -72,7 +72,13 @@ the first `putImage`.
 ## Pixel types and resolution
 
 Build the `(rgb, bitDepth)` pair from `Image.getNumComponents()` and `Image.getBytesPerPixel()`.
-This library supports GRAY8/GRAY16/GRAY32. Micro-Manager's Datastore is single-resolution, so the
+This library supports GRAY8/GRAY16/GRAY32 and 8-bit RGB. For RGB, Micro-Manager reports
+`getNumComponents() == 3` with `getBytesPerPixel() == 4`, so `rgb = true` and `bitDepth = 8`; hand
+the raw 4-byte-per-pixel `byte[]` (BGRA, alpha unused) straight to `putImage`/`putTile`. **Read
+contract:** `getImage`/`getRegion` return a **3-byte** interleaved RGB `byte[]` (`w*h*3`, order
+R,G,B), matching what is on disk. If the adapter needs Micro-Manager's 4-byte BGRA layout back
+(e.g. to build a `DefaultImage`), re-pad the 3 bytes to 4 and reorder R,G,B → B,G,R,A.
+Micro-Manager's Datastore is single-resolution, so the
 adapter only ever uses resolution level 0 — the pyramid is written to disk (as SubIFDs) for
 downstream viewers, but the adapter neither reads nor is asked for levels > 0.
 

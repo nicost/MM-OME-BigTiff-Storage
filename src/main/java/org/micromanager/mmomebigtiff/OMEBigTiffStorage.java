@@ -4,6 +4,7 @@ import org.micromanager.mmomebigtiff.metadata.OmeXmlBuilder;
 import org.micromanager.mmomebigtiff.metadata.PerImageMetadataStore;
 import org.micromanager.mmomebigtiff.tiff.PlaneLocation;
 import org.micromanager.mmomebigtiff.tiff.Tiles;
+import org.micromanager.mmomebigtiff.tiff.TiffPixelCodec;
 import org.micromanager.mmomebigtiff.tiff.TiffPyramidReader;
 import org.micromanager.mmomebigtiff.tiff.TiffPyramidWriter;
 import org.micromanager.mmomebigtiff.tiff.TiledTiffWriter;
@@ -225,14 +226,20 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       final String axesKey = AxesKey.serialize(axesCopy);
       final int posIndex = posIndexOf(axesCopy);
 
+      // Micro-Manager delivers RGB as 4 bytes/pixel (BGRA); unpack once to the 3-byte interleaved
+      // RGB layout stored on disk, so the pending-read buffer and the file agree byte-for-byte.
+      final Object storedPixels = pixelType.isRgb()
+            ? TiffPixelCodec.packBgraToRgb((byte[]) pixels, imageWidth * imageHeight)
+            : pixels;
+
       // Record per-image metadata in memory synchronously (readable immediately); the flushed
       // sidecar append happens on the writer thread.
       perImageMeta.put(axesKey, metadataJson);
-      pending.put(axesKey, new Pending(pixels, imageWidth, imageHeight));
+      pending.put(axesKey, new Pending(storedPixels, imageWidth, imageHeight));
 
       return submitWrite(() -> {
          TiffPyramidWriter writer = writerFor(posIndex);
-         PlaneLocation loc = writer.writePlane(pixels, imageWidth, imageHeight, metadataJson);
+         PlaneLocation loc = writer.writePlane(storedPixels, imageWidth, imageHeight, metadataJson);
          planeIndex.computeIfAbsent(posIndex, k -> new ConcurrentHashMap<>()).put(axesKey, loc);
          recordPlaneMapping(posIndex, axesCopy);
          perImageMeta.append(axesCopy, metadataJson);
@@ -280,7 +287,11 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       perImageMeta.put(axesKey, metadataJson);
       final boolean firstForPlane = appendedMeta.add(axesKey);
       final String tileKey = tileKey(posIndex, plane, tileCol, tileRow);
-      pendingTiles.put(tileKey, tilePixels);
+      // RGB tiles arrive as 4 bytes/pixel (BGRA); store the 3-byte interleaved RGB layout.
+      final Object storedTile = pixelType.isRgb()
+            ? TiffPixelCodec.packBgraToRgb((byte[]) tilePixels, tileWidth * tileHeight)
+            : tilePixels;
+      pendingTiles.put(tileKey, storedTile);
       // Create the writer synchronously so its geometry and already-committed tiles are visible to
       // concurrent readers even before this tile's write task runs.
       final TiledTiffWriter writer;
@@ -291,7 +302,7 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       }
 
       return submitWrite(() -> {
-         writer.writeTile(plane, 0, tileCol, tileRow, tilePixels);
+         writer.writeTile(plane, 0, tileCol, tileRow, storedTile);
          pendingTiles.remove(tileKey);
          if (firstForPlane) {
             perImageMeta.append(axesCopy, metadataJson);
@@ -559,7 +570,7 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
          }
          int w = (int) Math.min(wh[0], Integer.MAX_VALUE);
          int h = (int) Math.min(wh[1], Integer.MAX_VALUE);
-         return new EssentialImageMetadata(w, h, bitDepth, false);
+         return new EssentialImageMetadata(w, h, bitDepth, pixelType.isRgb());
       }
       Pending p = pending.get(axesKey);
       int w;
@@ -580,7 +591,7 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
          w = loc.width[level];
          h = loc.height[level];
       }
-      return new EssentialImageMetadata(w, h, bitDepth, false);
+      return new EssentialImageMetadata(w, h, bitDepth, pixelType.isRgb());
    }
 
    @Override
@@ -1045,6 +1056,8 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
       d.put("compression", config.getCompression().getId());
       d.put("numResolutionLevels", numResLevels);
       d.put("pixelType", pixelType == null ? null : pixelType.omeType());
+      // RGB8 shares the "uint8" OME type string with GRAY8, so record the flag explicitly.
+      d.put("rgb", pixelType != null && pixelType.isRgb());
       d.put("bitDepth", pixelType == null ? null : bitDepth);
       d.put("fullWidth", fullWidth);
       d.put("fullHeight", fullHeight);
@@ -1135,7 +1148,9 @@ public final class OMEBigTiffStorage implements MultiresOMEBigTiffAPI {
          this.declT = ((Number) d.getOrDefault("sizeT", 1)).intValue();
       }
       Object pt = d.get("pixelType");
-      this.pixelType = pt == null ? PixelType.GRAY16 : PixelType.fromOmeType(String.valueOf(pt));
+      boolean rgb = Boolean.TRUE.equals(d.get("rgb"));
+      this.pixelType = pt == null ? PixelType.GRAY16
+            : PixelType.fromOme(String.valueOf(pt), rgb ? 3 : 1);
       Object bd = d.get("bitDepth");
       this.bitDepth = bd instanceof Number && ((Number) bd).intValue() > 0
             ? ((Number) bd).intValue() : pixelType.bitDepth();

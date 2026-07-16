@@ -329,7 +329,8 @@ public final class TiledTiffWriter implements AutoCloseable {
             int dstY = dr * tileH;
             int copyW = Math.min(tileW, bw - dstX);
             int copyH = Math.min(tileH, bh - dstY);
-            TiffPixelCodec.copyRegion(srcTile, tileW, 0, 0, block, bw, dstX, dstY, copyW, copyH);
+            TiffPixelCodec.copyRegion(srcTile, tileW, 0, 0, block, bw, dstX, dstY, copyW, copyH,
+                  type.samplesPerPixel());
          }
       }
       if (!any) {
@@ -340,7 +341,7 @@ public final class TiledTiffWriter implements AutoCloseable {
       int rh = Downsampler.downHeight(bh);
       Object out = TiffPixelCodec.blankTile(type, tileW * tileH);
       TiffPixelCodec.copyRegion(reduced, rw, 0, 0, out, tileW, 0, 0,
-            Math.min(rw, tileW), Math.min(rh, tileH));
+            Math.min(rw, tileW), Math.min(rh, tileH), type.samplesPerPixel());
       return out;
    }
 
@@ -452,14 +453,14 @@ public final class TiledTiffWriter implements AutoCloseable {
       e = entryLong(buf, e, TAG_NEW_SUBFILE_TYPE, level == 0 ? 0 : 1);
       e = entryLong(buf, e, TAG_IMAGE_WIDTH, levelW[level]);
       e = entryLong(buf, e, TAG_IMAGE_LENGTH, levelH[level]);
-      e = entryShort(buf, e, TAG_BITS_PER_SAMPLE, type.bitDepth());
+      e = entryBitsPerSample(buf, e);
       e = entryShort(buf, e, TAG_COMPRESSION, compression.tiffCode());
-      e = entryShort(buf, e, TAG_PHOTOMETRIC, 1);
+      e = entryShort(buf, e, TAG_PHOTOMETRIC, type.photometric());
       if (plane == 0 && level == 0) {
          imageDescEntryLoc = at + e; // absolute file location; patched at finish()
          e = entryOffset(buf, e, TAG_IMAGE_DESCRIPTION, TYPE_ASCII, 1, 0);
       }
-      e = entryShort(buf, e, TAG_SAMPLES_PER_PIXEL, 1);
+      e = entryShort(buf, e, TAG_SAMPLES_PER_PIXEL, type.samplesPerPixel());
       e = entryRational(buf, e, TAG_X_RESOLUTION, resNumerator(level), 1);
       e = entryRational(buf, e, TAG_Y_RESOLUTION, resNumerator(level), 1);
       e = entryShort(buf, e, TAG_RESOLUTION_UNIT, 3);
@@ -496,7 +497,7 @@ public final class TiledTiffWriter implements AutoCloseable {
             e = entryOffset(buf, e, TAG_SUB_IFDS, TYPE_IFD8, subCount, subIfdsArrayPos);
          }
       }
-      e = entryShort(buf, e, TAG_SAMPLE_FORMAT, type.sampleFormat());
+      e = entrySampleFormat(buf, e);
       buf.putLong(e, nextIfd);
       writeAt(at, buf);
    }
@@ -545,6 +546,27 @@ public final class TiledTiffWriter implements AutoCloseable {
       int v = entryHeader(buf, at, tag, TYPE_SHORT, 1);
       buf.putShort(v, (short) value);
       return at + IFD_ENTRY_BYTES;
+   }
+
+   /**
+    * A SHORT entry with one value per sample: a scalar for grayscale, or an inline 3-count array
+    * for RGB (three SHORTs = 6 bytes fit the 8-byte BigTIFF value field).
+    */
+   private int entryPerSampleShort(ByteBuffer buf, int at, int tag, int perSampleValue) {
+      int spp = type.samplesPerPixel();
+      int v = entryHeader(buf, at, tag, TYPE_SHORT, spp);
+      for (int i = 0; i < spp; i++) {
+         buf.putShort(v + i * 2, (short) perSampleValue);
+      }
+      return at + IFD_ENTRY_BYTES;
+   }
+
+   private int entryBitsPerSample(ByteBuffer buf, int at) {
+      return entryPerSampleShort(buf, at, TAG_BITS_PER_SAMPLE, type.bitDepth());
+   }
+
+   private int entrySampleFormat(ByteBuffer buf, int at) {
+      return entryPerSampleShort(buf, at, TAG_SAMPLE_FORMAT, type.sampleFormat());
    }
 
    private int entryLong(ByteBuffer buf, int at, int tag, long value) {

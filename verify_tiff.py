@@ -85,10 +85,61 @@ def main():
         check(np.array_equal(lvl1_000, ref),
               "level-1 downsample of plane (0,0,0) matches 2x2 averaging")
 
+    # Optional RGB fixture (written alongside the grayscale one by VerificationFixtureTest).
+    rgb_root = root.parent / "verify-fixture-rgb.ome.tiff"
+    if rgb_root.exists():
+        check_rgb(rgb_root, fails)
+
     if fails:
         print(f"\n{len(fails)} check(s) FAILED")
         sys.exit(1)
     print("\nAll checks passed: valid pyramidal OME-BigTIFF.")
+
+
+RGB_W, RGB_H = 48, 32
+
+
+def expected_rgb():
+    """3-byte interleaved RGB (R,G,B) matching VerificationFixtureTest.writeRgbFixture."""
+    y, x = np.mgrid[0:RGB_H, 0:RGB_W]
+    r = ((x + y) & 0xFF).astype(np.uint8)
+    g = (y & 0xFF).astype(np.uint8)
+    b = (x & 0xFF).astype(np.uint8)
+    return np.stack([r, g, b], axis=-1)  # (H, W, 3)
+
+
+def check_rgb(rgb_root, fails):
+    print("\nRGB fixture:")
+
+    def check(cond, msg):
+        (print("  ok:", msg) if cond else fails.append("RGB: " + msg))
+        if not cond:
+            print("  FAIL:", msg)
+
+    tif_path = rgb_root / "verify-fixture-rgb.ome.tif"
+    check(tif_path.exists(), f"fixture present ({tif_path.name})")
+    if not tif_path.exists():
+        return
+
+    with tifffile.TiffFile(str(tif_path)) as tif:
+        check(tif.is_bigtiff, "file is BigTIFF")
+        check(tif.is_ome, "file carries OME-XML metadata")
+        page = tif.pages[0]
+        check(int(page.photometric) == 2, f"PhotometricInterpretation is RGB (got {int(page.photometric)})")
+        check(page.samplesperpixel == 3, f"SamplesPerPixel is 3 (got {page.samplesperpixel})")
+
+        ome = tif.ome_metadata or ""
+        check('SamplesPerPixel="3"' in ome, "OME SamplesPerPixel=3")
+        check('Interleaved="true"' in ome, "OME Interleaved=true")
+
+        series = tif.series[0]
+        data = series.asarray()
+        # tifffile may return (H, W, 3) for a single RGB plane.
+        rgb = data if data.ndim == 3 else data.reshape(RGB_H, RGB_W, 3)
+        check(rgb.shape[-3:] == (RGB_H, RGB_W, 3),
+              f"series shape {rgb.shape} ends with (H,W,3)=({RGB_H},{RGB_W},3)")
+        check(np.array_equal(rgb.reshape(RGB_H, RGB_W, 3), expected_rgb()),
+              "RGB pixel values match expected R,G,B")
 
 
 if __name__ == "__main__":

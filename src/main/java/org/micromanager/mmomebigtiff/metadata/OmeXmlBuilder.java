@@ -51,6 +51,12 @@ public final class OmeXmlBuilder {
                               List<Channel> channels, List<PlaneEntry> planes) {
       String omeUnit = omeUnit(unit);
       int sigBits = significantBits > 0 ? significantBits : type.bitDepth();
+      boolean rgb = type.isRgb();
+      // For RGB the three colour samples live in a single OME Channel, so SizeC is 1 regardless of
+      // any channel axis; a colour acquisition has no separate C dimension.
+      if (rgb) {
+         sizeC = 1;
+      }
       StringBuilder sb = new StringBuilder(2048);
       sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
       sb.append("<OME xmlns=\"").append(Version.OME_NS).append("\" ")
@@ -59,8 +65,8 @@ public final class OmeXmlBuilder {
             .append(Version.OME_NS).append("/ome.xsd\">\n");
       sb.append("  <Image ID=\"Image:0\" Name=\"").append(esc(imageName)).append("\">\n");
       sb.append("    <Pixels ID=\"Pixels:0\" DimensionOrder=\"XYZCT\" Type=\"")
-            .append(type.omeType()).append("\" Interleaved=\"false\" SignificantBits=\"")
-            .append(sigBits).append("\" ")
+            .append(type.omeType()).append("\" Interleaved=\"").append(rgb ? "true" : "false")
+            .append("\" SignificantBits=\"").append(sigBits).append("\" ")
             .append("SizeX=\"").append(sizeX).append("\" SizeY=\"").append(sizeY).append("\" ")
             .append("SizeZ=\"").append(sizeZ).append("\" SizeC=\"").append(sizeC).append("\" ")
             .append("SizeT=\"").append(sizeT).append("\"");
@@ -74,9 +80,12 @@ public final class OmeXmlBuilder {
       }
       sb.append(">\n");
 
+      int samplesPerPixel = type.samplesPerPixel();
       for (int c = 0; c < sizeC; c++) {
-         Channel ch = channels != null && c < channels.size() ? channels.get(c) : null;
-         sb.append("      <Channel ID=\"Channel:0:").append(c).append("\" SamplesPerPixel=\"1\"");
+         // RGB: a single Channel carries all three samples (channels list, if any, is ignored).
+         Channel ch = !rgb && channels != null && c < channels.size() ? channels.get(c) : null;
+         sb.append("      <Channel ID=\"Channel:0:").append(c).append("\" SamplesPerPixel=\"")
+               .append(samplesPerPixel).append("\"");
          if (ch != null) {
             sb.append(" Name=\"").append(esc(ch.getName())).append("\"");
             Integer color = argbColor(ch.getColor());

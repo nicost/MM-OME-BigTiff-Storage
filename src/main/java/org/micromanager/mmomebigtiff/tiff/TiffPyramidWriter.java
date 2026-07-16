@@ -342,15 +342,15 @@ public final class TiffPyramidWriter implements AutoCloseable {
       e = entryLong(buf, e, TAG_NEW_SUBFILE_TYPE, 0);
       e = entryLong(buf, e, TAG_IMAGE_WIDTH, w);
       e = entryLong(buf, e, TAG_IMAGE_LENGTH, h);
-      e = entryShort(buf, e, TAG_BITS_PER_SAMPLE, type.bitDepth());
+      e = entryBitsPerSample(buf, e);
       e = entryShort(buf, e, TAG_COMPRESSION, compression.tiffCode());
-      e = entryShort(buf, e, TAG_PHOTOMETRIC, 1);
+      e = entryShort(buf, e, TAG_PHOTOMETRIC, type.photometric());
       if (firstPlane) {
          imageDescAbs = base + e; // absolute file location of this entry (buf index 0 == base)
          e = entryOffset(buf, e, TAG_IMAGE_DESCRIPTION, TYPE_ASCII, 1, 0); // patched at finish()
       }
       e = entryLong8(buf, e, TAG_STRIP_OFFSETS, TYPE_LONG8, stripOffset);
-      e = entryShort(buf, e, TAG_SAMPLES_PER_PIXEL, 1);
+      e = entryShort(buf, e, TAG_SAMPLES_PER_PIXEL, type.samplesPerPixel());
       e = entryLong(buf, e, TAG_ROWS_PER_STRIP, h);
       e = entryLong8(buf, e, TAG_STRIP_BYTE_COUNTS, TYPE_LONG8, stripBytes);
       e = entryRational(buf, e, TAG_X_RESOLUTION, resNumerator(0), 1);
@@ -365,7 +365,7 @@ public final class TiffPyramidWriter implements AutoCloseable {
             e = entryOffset(buf, e, TAG_SUB_IFDS, TYPE_IFD8, subCount, subArrayOff);
          }
       }
-      e = entryShort(buf, e, TAG_SAMPLE_FORMAT, type.sampleFormat());
+      e = entrySampleFormat(buf, e);
       if (metaBytes != null) {
          e = entryOffset(buf, e, TAG_MM_METADATA, TYPE_ASCII, metaBytes.length, metaOff);
       }
@@ -380,17 +380,17 @@ public final class TiffPyramidWriter implements AutoCloseable {
       e = entryLong(buf, e, TAG_NEW_SUBFILE_TYPE, 1); // reduced-resolution
       e = entryLong(buf, e, TAG_IMAGE_WIDTH, w);
       e = entryLong(buf, e, TAG_IMAGE_LENGTH, h);
-      e = entryShort(buf, e, TAG_BITS_PER_SAMPLE, type.bitDepth());
+      e = entryBitsPerSample(buf, e);
       e = entryShort(buf, e, TAG_COMPRESSION, compression.tiffCode());
-      e = entryShort(buf, e, TAG_PHOTOMETRIC, 1);
+      e = entryShort(buf, e, TAG_PHOTOMETRIC, type.photometric());
       e = entryLong8(buf, e, TAG_STRIP_OFFSETS, TYPE_LONG8, stripOffset);
-      e = entryShort(buf, e, TAG_SAMPLES_PER_PIXEL, 1);
+      e = entryShort(buf, e, TAG_SAMPLES_PER_PIXEL, type.samplesPerPixel());
       e = entryLong(buf, e, TAG_ROWS_PER_STRIP, h);
       e = entryLong8(buf, e, TAG_STRIP_BYTE_COUNTS, TYPE_LONG8, stripBytes);
       e = entryRational(buf, e, TAG_X_RESOLUTION, resNumerator(level), 1);
       e = entryRational(buf, e, TAG_Y_RESOLUTION, resNumerator(level), 1);
       e = entryShort(buf, e, TAG_RESOLUTION_UNIT, 3);
-      e = entryShort(buf, e, TAG_SAMPLE_FORMAT, type.sampleFormat());
+      e = entrySampleFormat(buf, e);
       buf.putLong(e, 0L); // SubIFDs are not chained
    }
 
@@ -416,6 +416,27 @@ public final class TiffPyramidWriter implements AutoCloseable {
       int v = entryHeader(buf, at, tag, TYPE_SHORT, 1);
       buf.putShort(v, (short) value);
       return at + IFD_ENTRY_BYTES;
+   }
+
+   /**
+    * A SHORT entry with one value per sample: a scalar for grayscale, or an inline 3-count array
+    * for RGB (three SHORTs = 6 bytes fit the 8-byte BigTIFF value field, so no out-of-line data).
+    */
+   private int entryPerSampleShort(ByteBuffer buf, int at, int tag, int perSampleValue) {
+      int spp = type.samplesPerPixel();
+      int v = entryHeader(buf, at, tag, TYPE_SHORT, spp);
+      for (int i = 0; i < spp; i++) {
+         buf.putShort(v + i * 2, (short) perSampleValue);
+      }
+      return at + IFD_ENTRY_BYTES;
+   }
+
+   private int entryBitsPerSample(ByteBuffer buf, int at) {
+      return entryPerSampleShort(buf, at, TAG_BITS_PER_SAMPLE, type.bitDepth());
+   }
+
+   private int entrySampleFormat(ByteBuffer buf, int at) {
+      return entryPerSampleShort(buf, at, TAG_SAMPLE_FORMAT, type.sampleFormat());
    }
 
    private int entryLong(ByteBuffer buf, int at, int tag, long value) {

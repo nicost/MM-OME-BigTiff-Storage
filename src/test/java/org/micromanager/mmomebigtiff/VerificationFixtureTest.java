@@ -73,5 +73,47 @@ public class VerificationFixtureTest {
       store.close();
 
       System.out.println("Wrote fixture to " + fixture.toAbsolutePath());
+
+      writeRgbFixture(target);
+   }
+
+   /**
+    * A small single-plane 8-bit RGB fixture ({@code verify-fixture-rgb.ome.tiff}) that
+    * {@code verify_tiff.py} checks for photometric=RGB, SamplesPerPixel=3 and exact pixels.
+    * Input is Micro-Manager-style 4-byte BGRA; the stored/expected layout is 3-byte RGB.
+    */
+   private void writeRgbFixture(Path target) throws Exception {
+      Path fixture = target.resolve("verify-fixture-rgb.ome.tiff");
+      if (Files.exists(fixture)) {
+         try (java.util.stream.Stream<Path> s = Files.walk(fixture)) {
+            s.sorted((a, b) -> b.getNameCount() - a.getNameCount())
+                  .forEach(p -> p.toFile().delete());
+         }
+      }
+
+      int w = 48;
+      int h = 32;
+      OMEBigTiffStorageConfig cfg = new OMEBigTiffStorageConfig()
+            .numResolutionLevels(2)
+            .addAxis(AxisInfo.builder("time").type(DimensionType.TIME).build());
+      OMEBigTiffStorage store = new OMEBigTiffStorage("target", "verify-fixture-rgb", null, cfg);
+
+      byte[] bgra = new byte[w * h * 4];
+      for (int y = 0; y < h; y++) {
+         for (int x = 0; x < w; x++) {
+            int s = (y * w + x) * 4;
+            bgra[s]     = (byte) (x & 0xFF);        // B
+            bgra[s + 1] = (byte) (y & 0xFF);        // G
+            bgra[s + 2] = (byte) ((x + y) & 0xFF);  // R
+            bgra[s + 3] = (byte) 0xFF;
+         }
+      }
+      Map<String, Object> axes = new HashMap<>();
+      axes.put("time", 0);
+      store.putImage(bgra, "{\"rgb\":true}", axes, true, 8, h, w);
+      store.finishedWriting();
+      store.close();
+
+      System.out.println("Wrote RGB fixture to " + fixture.toAbsolutePath());
    }
 }

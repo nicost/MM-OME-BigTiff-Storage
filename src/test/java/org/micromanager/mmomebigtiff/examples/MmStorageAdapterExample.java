@@ -81,7 +81,11 @@ public final class MmStorageAdapterExample {
       }
       Map<String, Object> axes = coordsToAxes(image.getCoords());
       boolean rgb = image.getNumComponents() > 1;
-      int bitDepth = image.getBytesPerPixel() / Math.max(1, image.getNumComponents()) * 8;
+      // For RGB, Micro-Manager reports 3 components in a 4-byte pixel; the library stores 8-bit
+      // RGB and expects bitDepth == 8. The raw byte[] is passed through as-is (4-byte BGRA); the
+      // library unpacks it to 3-sample RGB on write.
+      int bitDepth = rgb ? 8
+            : image.getBytesPerPixel() / Math.max(1, image.getNumComponents()) * 8;
       storage.putImage(image.getRawPixels(), image.getMetadataJson(), axes,
             rgb, bitDepth, image.getHeight(), image.getWidth());
    }

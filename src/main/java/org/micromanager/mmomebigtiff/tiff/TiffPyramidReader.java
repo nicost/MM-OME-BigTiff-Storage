@@ -449,7 +449,14 @@ public final class TiffPyramidReader implements AutoCloseable {
             throw new IOException("OME-XML has no Pixels element");
          }
          Ome ome = new Ome();
-         ome.type = PixelType.fromOmeType(pixels.getAttribute("Type"));
+         // SamplesPerPixel lives on Pixels (or, for older writers, on the first Channel); it is
+         // what distinguishes RGB (3) from grayscale (1), since RGB8 shares Type="uint8".
+         int spp = intAttr(pixels, "SamplesPerPixel", 0);
+         if (spp <= 0) {
+            Element ch = firstElement(pixels.getElementsByTagName("Channel"));
+            spp = ch == null ? 1 : intAttr(ch, "SamplesPerPixel", 1);
+         }
+         ome.type = PixelType.fromOme(pixels.getAttribute("Type"), spp);
          ome.sizeX = intAttr(pixels, "SizeX", 0);
          ome.sizeY = intAttr(pixels, "SizeY", 0);
          ome.sizeZ = intAttr(pixels, "SizeZ", 1);

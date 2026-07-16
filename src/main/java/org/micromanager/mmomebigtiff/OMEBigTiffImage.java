@@ -10,7 +10,11 @@ package org.micromanager.mmomebigtiff;
  */
 public final class OMEBigTiffImage {
 
-   /** Primitive pixel array: {@code byte[]}, {@code short[]} or {@code float[]}. */
+   /**
+    * Primitive pixel array: {@code byte[]}, {@code short[]} or {@code float[]}. For RGB images this
+    * is a {@code byte[]} of {@code width*height*3} interleaved samples ordered R,G,B (the unused
+    * alpha byte of Micro-Manager's 4-byte input is dropped on write).
+    */
    public final Object pix;
 
    /** Per-image metadata as a JSON string, or {@code null} if none was stored. */

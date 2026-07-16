@@ -34,7 +34,8 @@ runnable example under `src/test/.../examples/`).
 - **OME-XML metadata** (`Pixels`, `Channel`, per-plane `TiffData`) in the first IFD's
   `ImageDescription`, plus per-image metadata embedded in a private TIFF tag and kept in an
   append-only NDJSON sidecar for fast indexed reads.
-- **Grayscale** GRAY8 / GRAY16 / GRAY32(float), uncompressed or **Deflate** (zlib) compressed.
+- **Grayscale** GRAY8 / GRAY16 / GRAY32(float) and **8-bit RGB**, uncompressed or **Deflate**
+  (zlib) compressed.
 - Multi-position acquisitions are written as **one self-contained OME-BigTIFF file per position**.
 
 ## Quick start
@@ -151,9 +152,27 @@ mvn test                         # writes the fixture
 python verify_tiff.py            # requires: tifffile, numpy
 ```
 
+## RGB images
+
+8-bit colour is supported alongside grayscale. Pass `rgb = true` (and `bitDepth = 8`) to
+`putImage`/`putTile`; the pixel array is Micro-Manager's native **4-bytes-per-pixel** `byte[]`
+(interleaved BGRA, alpha unused). It is stored as standard interoperable **3-sample chunky RGB**
+(`SamplesPerPixel=3`, `PhotometricInterpretation=RGB`, `BitsPerSample=8,8,8`) so it opens as colour
+in QuPath, Fiji/Bio-Formats and `tifffile`. Reads (`getImage`/`getRegion`) return a **3-byte**
+interleaved `byte[]` (R,G,B) of `width*height*3` — the exact on-disk layout, with the unused alpha
+byte dropped; an adapter that needs MM's 4-byte BGRA back re-pads it. Pyramid downsampling averages
+each colour channel independently. 16-bit RGB is not supported (use grayscale for higher bit depths).
+
+```java
+store.putImage(bgraPixels /* byte[w*h*4] */, meta, axes,
+               true /* rgb */, 8 /* bitDepth */, height, width);
+OMEBigTiffImage img = store.getImage(axes);   // img.pix is byte[w*h*3] interleaved R,G,B
+```
+
 ## Limitations (v1)
 
-- **Grayscale only** (GRAY8/GRAY16/GRAY32). RGB is rejected with a clear error.
+- **8-bit RGB only** for colour (GRAY8/GRAY16/GRAY32 for grayscale). 16-bit RGB is rejected with a
+  clear error.
 - **Fixed pyramid depth.** A plane's SubIFD array is written inline with the plane, so the number
   of resolution levels is fixed once the first image is written; set it up front via
   `numResolutionLevels`. `setMaxResolutionLevel` therefore only raises the level count *before*

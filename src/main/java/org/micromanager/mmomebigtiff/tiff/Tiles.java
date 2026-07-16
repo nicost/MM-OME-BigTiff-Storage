@@ -57,7 +57,8 @@ public final class Tiles {
             int srcY = (int) (oy0 - tileY0);
             int dstX = (int) (ox0 - x);
             int dstY = (int) (oy0 - y);
-            TiffPixelCodec.copyRegion(tile, tileWidth, srcX, srcY, out, w, dstX, dstY, ow, oh);
+            TiffPixelCodec.copyRegion(tile, tileWidth, srcX, srcY, out, w, dstX, dstY, ow, oh,
+                  type.samplesPerPixel());
          }
       }
       return out;
