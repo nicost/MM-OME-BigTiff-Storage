@@ -33,16 +33,14 @@ jobs:
 
       - name: Deploy
         if: ${{ !inputs.dry_run }}
-        run: mvn -B -Prelease clean deploy
+        run: mvn -B -Prelease clean deploy -Dgpg.passphrase="${GPG_PASSPHRASE}"
         env:
           CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
           CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
 
       - name: Dry run (build + sign, no upload)
         if: ${{ inputs.dry_run }}
-        run: mvn -B -Prelease clean verify
+        run: mvn -B -Prelease clean verify -Dgpg.passphrase="${GPG_PASSPHRASE}"
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
