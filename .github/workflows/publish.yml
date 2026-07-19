@@ -17,8 +17,8 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
-      # setup-java imports the GPG private key and writes ~/.m2/settings.xml
-      # with a "central" server whose credentials come from the env vars named below.
+      # setup-java writes ~/.m2/settings.xml with a "central" server whose
+      # credentials come from the env vars named below.
       - name: Set up JDK
         uses: actions/setup-java@v4
         with:
@@ -27,20 +27,27 @@ jobs:
           server-id: central
           server-username: CENTRAL_USERNAME
           server-password: CENTRAL_PASSWORD
-          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
-          gpg-passphrase: GPG_PASSPHRASE
           cache: maven
+
+      # Import the GPG key explicitly — more reliable than setup-java's built-in
+      # import, which can silently fail if the key format has any issues.
+      # Store GPG_PRIVATE_KEY as the raw ASCII-armored output of:
+      #   gpg --export-secret-keys --armor <KEY_ID>
+      - name: Import GPG key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          gpg --list-secret-keys --keyid-format LONG
 
       - name: Deploy
         if: ${{ !inputs.dry_run }}
-        run: mvn -B -Prelease clean deploy -Dgpg.passphrase="${GPG_PASSPHRASE}"
+        run: mvn -B -Prelease clean deploy
         env:
           CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
           CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
 
       - name: Dry run (build + sign, no upload)
         if: ${{ inputs.dry_run }}
-        run: mvn -B -Prelease clean verify -Dgpg.passphrase="${GPG_PASSPHRASE}"
+        run: mvn -B -Prelease clean verify
         env:
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
